@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: ga5-incident-agent
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false          # set this in the Render dashboard (your paid key)
+      - key: MODEL_NAME
+        value: gpt-4o-mini
+      - key: OPENAI_BASE_URL
+        value: https://api.openai.com/v1
