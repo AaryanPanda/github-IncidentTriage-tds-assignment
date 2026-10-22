@@ -18,12 +18,14 @@ Env vars:
 import os
 import re
 import json
+import time
 import hashlib
 import secrets
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+from starlette.responses import Response as RawResponse
 
 app = FastAPI()
 
@@ -34,6 +36,69 @@ USE_STUB = os.environ.get("USE_STUB_PLANNER", "").lower() in ("1", "true", "yes"
 
 # runId -> stored run state. In-memory is fine for a single verification burst.
 RUNS = {}
+
+# --------------------------------------------------------------------------- #
+#  Debug capture ("peek"): records the last N /v2/* requests + responses so we
+#  can see exactly what the grader sent (headers, bodies) and what we returned.
+#  Off unless DEBUG_TOKEN is set. Sensitive values and the big transcript are
+#  scrubbed from the dump. View it at  GET /debug/peek?token=<DEBUG_TOKEN>.
+# --------------------------------------------------------------------------- #
+DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN", "")
+DEBUG_LOG = []
+DEBUG_MAX = 60
+
+
+def _scrub(obj):
+    """Deep copy with sensitive object and the long transcript trimmed."""
+    try:
+        d = json.loads(json.dumps(obj))
+    except Exception:
+        return obj
+    if isinstance(d, dict):
+        if "sensitive" in d:
+            d["sensitive"] = "[REDACTED]"
+        inc = d.get("incident")
+        if isinstance(inc, dict) and isinstance(inc.get("transcript"), str):
+            tr = inc["transcript"]
+            inc["transcript"] = {"_len": len(tr), "_head": tr[:400]}
+    return d
+
+
+@app.middleware("http")
+async def capture(request: Request, call_next):
+    body = await request.body()
+
+    async def receive():                      # let the endpoint read the body again
+        return {"type": "http.request", "body": body, "more_body": False}
+    request._receive = receive
+
+    resp = await call_next(request)
+    chunks = [section async for section in resp.body_iterator]
+    resp_body = b"".join(chunks)
+    headers = dict(resp.headers)
+    headers.pop("content-length", None)
+    rebuilt = RawResponse(content=resp_body, status_code=resp.status_code,
+                          headers=headers, media_type=resp.media_type)
+
+    if DEBUG_TOKEN and request.url.path.startswith("/v2/"):
+        try:
+            req_json = _scrub(json.loads(body)) if body else None
+        except Exception:
+            req_json = {"_raw": body[:500].decode("utf-8", "replace")}
+        try:
+            resp_json = json.loads(resp_body)
+        except Exception:
+            resp_json = {"_raw": resp_body[:500].decode("utf-8", "replace")}
+        DEBUG_LOG.append({
+            "ts": round(time.time(), 3),
+            "method": request.method, "path": request.url.path,
+            "traceparent": request.headers.get("traceparent"),
+            "tracestate": request.headers.get("tracestate"),
+            "status": resp.status_code,
+            "request": req_json, "response": resp_json,
+        })
+        del DEBUG_LOG[:-DEBUG_MAX]
+    return rebuilt
 
 
 # --------------------------------------------------------------------------- #
@@ -460,6 +525,17 @@ def decide_next(st):
 @app.get("/")
 async def root():
     return {"ok": True, "service": "ga5-incident-agent"}
+
+
+@app.get("/debug/peek")
+async def peek(token: str = ""):
+    if not DEBUG_TOKEN or token != DEBUG_TOKEN:
+        return bad("not found", 404)
+    counts = {}
+    for e in DEBUG_LOG:
+        key = f"{e['method']} {e['path'].split('/v2/incidents')[-1] or '/'} -> {e['status']}"
+        counts[key] = counts.get(key, 0) + 1
+    return JSONResponse({"count": len(DEBUG_LOG), "summary": counts, "events": DEBUG_LOG})
 
 
 @app.post("/v2/incidents")
