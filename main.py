@@ -46,6 +46,8 @@ RUNS = {}
 DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN", "")
 DEBUG_LOG = []
 DEBUG_MAX = 60
+INSIGHTS = []        # per-run: full transcript + model reasoning + our plan (debug only)
+INSIGHTS_MAX = 10
 
 
 def _scrub(obj):
@@ -328,17 +330,19 @@ def normalize_plan(raw, body):
     }
 
 
-async def plan(body):
-    """Never raises: on any model failure, fall back to the deterministic planner so
+async def plan_capture(body):
+    """Return (normalized_plan, raw_model_output, used_fallback). Never raises, so
     POST /v2/incidents always returns a valid 200 within the deadline (no 502)."""
     use_stub = USE_STUB or "OPENAI_API_KEY" not in os.environ
     if use_stub:
-        return normalize_plan(stub_plan(body), body)
+        raw = stub_plan(body)
+        return normalize_plan(raw, body), raw, True
     try:
         raw = await call_openai(body, timeout=12.0)
-        return normalize_plan(raw, body)
+        return normalize_plan(raw, body), raw, False
     except Exception:
-        return normalize_plan(stub_plan(body), body)
+        raw = stub_plan(body)
+        return normalize_plan(raw, body), raw, True
 
 
 # --------------------------------------------------------------------------- #
@@ -583,6 +587,21 @@ async def peek(token: str = ""):
     return JSONResponse({"count": len(DEBUG_LOG), "summary": counts, "events": DEBUG_LOG})
 
 
+@app.get("/debug/insights")
+async def insights(token: str = "", i: int = -1):
+    if not DEBUG_TOKEN or token != DEBUG_TOKEN:
+        return bad("not found", 404)
+    if i == -1:
+        return JSONResponse({"count": len(INSIGHTS),
+                             "index": [{"i": n, "incidentId": r["incidentId"],
+                                        "service": r["service"], "rootCause": r["ourPlan"]["rootCause"],
+                                        "usedFallback": r["usedFallback"]}
+                                       for n, r in enumerate(INSIGHTS)]})
+    if 0 <= i < len(INSIGHTS):
+        return JSONResponse(INSIGHTS[i])
+    return bad("index out of range", 404)
+
+
 @app.post("/v2/incidents")
 async def create_incident(req: Request):
     raw = await req.body()
@@ -613,10 +632,29 @@ async def create_incident(req: Request):
 
     tc = parse_traceparent(req.headers.get("traceparent"), req.headers.get("tracestate"))
     try:
-        p = await plan(body)
+        p, raw_model, used_fallback = await plan_capture(body)
     except Exception:
         # last-resort safety: never return 502, which would be a transport failure
-        p = normalize_plan(stub_plan(body), body)
+        raw_model = stub_plan(body)
+        p = normalize_plan(raw_model, body)
+        used_fallback = True
+
+    if DEBUG_TOKEN:
+        INSIGHTS.append({
+            "runId": run_id, "incidentId": inc.get("incidentId"), "service": inc.get("service"),
+            "model": MODEL_NAME, "usedFallback": used_fallback,
+            "allowedRootCauses": inc["allowedRootCauses"],
+            "toolCatalog": [{"name": t.get("name"),
+                             "required": (t.get("inputSchema") or {}).get("required", [])}
+                            for t in body["toolCatalog"]],
+            "transcript": inc["transcript"],       # FULL transcript for analysis
+            "modelRaw": raw_model,                  # includes the model's reasoning field
+            "ourPlan": {"rootCause": p["rootCause"], "evidence": p["evidence"],
+                        "diagnostics": [{"toolName": d["toolName"], "arguments": d["arguments"],
+                                         "evidence": d["evidence"]} for d in p["diagnostics"]],
+                        "effect": p["effect"]},
+        })
+        del INSIGHTS[:-INSIGHTS_MAX]
 
     use_stub = USE_STUB or "OPENAI_API_KEY" not in os.environ
     st = {
